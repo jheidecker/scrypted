@@ -575,6 +575,8 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
                 .map(choice => `${choice}`.toLowerCase())
                 .filter(choice => !!choice);
             this.storage.setItem(key, JSON.stringify(selected));
+            // the base class ends every save with this, and the ui relies on it to settle.
+            this.onDeviceEvent(ScryptedInterface.Settings, undefined);
             this.listener?.then(l => l.emit('error', new Error("new settings")));
             return;
         }
@@ -586,8 +588,10 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
             // an explicit choice supersedes any earlier automatic fallback.
             this.storage.removeItem('onvifPushFallback');
             // report the endpoint interface before the listener restarts and generates the
-            // callback url, otherwise the server will not route the camera's post.
-            this.updateDevice();
+            // callback url, otherwise the server will not route the camera's post. awaited so
+            // the save does not complete while the device is still being re-registered with a
+            // different interface list.
+            await this.updateDevice();
             // restart the event listener, as RtspSmartCamera.putSetting would have.
             this.listener?.then(l => l.emit('error', new Error("new settings")));
             return;
