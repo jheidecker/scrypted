@@ -403,8 +403,10 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
         return ret;
     }
 
-    createClient() {
-        return connectCameraAPI(this.getHttpAddress(), this.getUsername(), this.getPassword(), this.console, this.storage.getItem('onvifDoorbellEvent'));
+    async createClient() {
+        const client = await connectCameraAPI(this.getHttpAddress(), this.getUsername(), this.getPassword(), this.console, this.storage.getItem('onvifDoorbellEvent'));
+        client.debugEvents = this.storage.getItem('onvifEventDebug') === 'true';
+        return client;
     }
 
     async getClient() {
@@ -504,6 +506,15 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
                 value: await this.getPushCallbackUrl(),
             });
         }
+
+        ret.push({
+            subgroup: 'Advanced',
+            title: 'Log ONVIF Events',
+            description: "Log every event this camera reports, with its topic and properties, to this camera's console. Useful for discovering the detection classes a camera actually sends, which is not always what it advertises. Enable Debug instead for the raw SOAP.",
+            type: 'boolean',
+            key: 'onvifEventDebug',
+            value: (this.storage.getItem('onvifEventDebug') === 'true').toString(),
+        });
 
         const ac = {
             ...automaticallyConfigureSettings,

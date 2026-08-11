@@ -254,6 +254,52 @@ async function main() {
         assert.deepStrictEqual(await client.getEventTypes(), []);
     });
 
+    await test('event debug logging reports the topic, properties and both timestamps', async () => {
+        const logs: string[] = [];
+        const cam = new EventEmitter() as any;
+        cam.events = {};
+        cam.parseEventXML = Cam.prototype.parseEventXML;
+        const client = new OnvifCameraAPI(cam, 'user', 'pass', {
+            log: (...args: any[]) => logs.push(args.join(' ')),
+            warn() { },
+            error() { },
+        } as any as Console, undefined);
+        client.debugEvents = true;
+        client.detections = new Map();
+
+        await client.handlePushXml(new EventEmitter(), notifyXml({
+            topic: 'tns1:RuleEngine/SomeVendorDetector/Whatever',
+            data: [['IsSomethingNew', 'true'], ['Confidence', '87']],
+            utcTime: '2019-05-05T01:02:03Z',
+        }));
+
+        const line = logs.find(l => l.startsWith('onvif event:'));
+        assert.ok(line, 'expected a debug line for an unrecognized topic');
+        const logged = JSON.parse(line.substring('onvif event:'.length));
+        assert.strictEqual(logged.topic, 'RuleEngine/SomeVendorDetector/Whatever');
+        assert.deepStrictEqual(logged.data, { IsSomethingNew: true, Confidence: 87 });
+        assert.strictEqual(logged.cameraUtcTime, '2019-05-05T01:02:03.000Z');
+        assert.ok(logged.receivedAt > logged.cameraUtcTime, 'local receive time should be logged too');
+    });
+
+    await test('event debug logging is off unless asked for', async () => {
+        const logs: string[] = [];
+        const cam = new EventEmitter() as any;
+        cam.events = {};
+        cam.parseEventXML = Cam.prototype.parseEventXML;
+        const client = new OnvifCameraAPI(cam, 'user', 'pass', {
+            log: (...args: any[]) => logs.push(args.join(' ')),
+            warn() { },
+            error() { },
+        } as any as Console, undefined);
+        client.detections = new Map();
+        await client.handlePushXml(new EventEmitter(), notifyXml({
+            topic: 'tns1:RuleEngine/CellMotionDetector/Motion',
+            data: [['IsMotion', 'true']],
+        }));
+        assert.ok(!logs.some(l => l.startsWith('onvif event:')));
+    });
+
     // ---- push transport ------------------------------------------------------------------
 
     await test('a pushed Notify is classified identically to a pulled one', async () => {

@@ -92,6 +92,11 @@ export class OnvifCameraAPI {
     credential: AuthFetchCredentialState;
     detections: Map<string, string>;
     loggedUnknownProperties = new Set<string>();
+    /**
+     * When set, every notification is logged in normalized form. Intended for discovering the
+     * topics and properties a camera actually reports, which is not always what it advertised.
+     */
+    debugEvents = false;
 
     constructor(public cam: any, username: string, password: string, public console: Console, binaryStateEvent: string) {
         this.binaryStateEvent = binaryStateEvent
@@ -226,6 +231,19 @@ export class OnvifCameraAPI {
         const dataValue = dataItems[0].$.Value;
         const eventTopic = stripNamespaces(topic);
         const operation = message.$?.PropertyOperation;
+
+        if (this.debugEvents) {
+            // the camera supplied time is logged alongside the local receive time because some
+            // firmware reuses a stale value, and only the local time is trustworthy.
+            this.console.log('onvif event:', JSON.stringify({
+                topic: eventTopic,
+                operation,
+                source: normalizeSimpleItems(message.source).values,
+                data,
+                cameraUtcTime: message.$?.UtcTime,
+                receivedAt: new Date().toISOString(),
+            }));
+        }
 
         ret.emit('onvifEvent', eventTopic, dataValue);
 
