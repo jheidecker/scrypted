@@ -321,10 +321,29 @@ async function main() {
         }
     });
 
-    await test('renew failure propagates so the subscription can be rebuilt', async () => {
+    await test('renew failure propagates so the subscription can be replaced', async () => {
         const { cam, client } = createClient();
         cam.renew = (options: any, cb: any) => cb(new Error('renew rejected'));
         await assert.rejects(() => client.pushRenew(), /renew rejected/);
+    });
+
+    await test('a fresh subscribe still works after renew has been rejected', async () => {
+        // a camera that has restarted no longer knows the subscription and answers Renew with
+        // a SOAP fault, while still honouring Subscribe. the transport replaces the
+        // subscription rather than retrying a renewal that cannot succeed.
+        const { cam, client } = createClient();
+        cam.renew = (options: any, cb: any) => cb(new Error('ONVIF SOAP Fault: error'));
+        let unsubscribed = false;
+        cam.unsubscribe = (cb: any) => { unsubscribed = true; cb(null, {}); };
+        cam.subscribe = (options: any, cb: any) => cb(null, {
+            currentTime: new Date('2020-01-01T00:00:00Z'),
+            terminationTime: new Date('2020-01-01T00:02:00Z'),
+        });
+
+        await assert.rejects(() => client.pushRenew());
+        await client.unsubscribe();
+        assert.ok(unsubscribed, 'the stale subscription should be dropped before replacing it');
+        assert.strictEqual(await client.pushSubscribe('http://localhost/callback'), 120000);
     });
 
     // ---- tapo ----------------------------------------------------------------------------

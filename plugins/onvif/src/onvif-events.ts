@@ -23,6 +23,7 @@ const MIN_RENEW_MS = 15000;
 const MAX_RENEW_MS = 600000;
 // bounded backoff used while there is still lease time remaining.
 const RENEW_RETRY_MS = 10000;
+const MAX_SUBSCRIBE_FAILURES = 3;
 
 function computeRenewDelay(leaseMs: number) {
     return Math.min(Math.max(leaseMs * RENEW_LEASE_FRACTION, MIN_RENEW_MS), MAX_RENEW_MS);
@@ -80,51 +81,70 @@ export async function listenEvents(thisDevice: ScryptedDeviceBase, client: Onvif
             clearTimeout(renewTimeout);
             if (destroyed)
                 return;
-            renewTimeout = setTimeout(renew, delay);
+            renewTimeout = setTimeout(maintain, delay);
         };
 
         // the lease expiry as computed from the last accepted subscription, used to decide
-        // whether a failed renew still has time left to retry.
+        // whether a failed maintenance attempt still has time left to retry.
         let leaseExpires = 0;
+        let failures = 0;
 
-        const renew = async () => {
+        const accepted = (lease: number, what: string) => {
+            leaseExpires = Date.now() + lease;
+            failures = 0;
+            const delay = computeRenewDelay(lease);
+            thisDevice.console.log(`onvif push subscription ${what}; lease=${Math.round(lease / 1000)}s; renew in=${Math.round(delay / 1000)}s`);
+            // the rtsp listen loop destroys a listener that has been idle for five minutes.
+            // a push camera may legitimately have nothing to report for far longer than that,
+            // so keeping the subscription alive counts as listener activity.
+            events.emit('data', `onvif push subscription ${what}`);
+            scheduleRenew(delay);
+        };
+
+        const maintain = async () => {
             if (destroyed)
                 return;
+
             try {
-                const lease = await client.pushRenew();
-                if (destroyed)
-                    return;
-                leaseExpires = Date.now() + lease;
-                const delay = computeRenewDelay(lease);
-                thisDevice.console.log(`onvif push subscription renewed; lease=${Math.round(lease / 1000)}s; renew in=${Math.round(delay / 1000)}s`);
-                // the rtsp listen loop destroys a listener that has been idle for five minutes.
-                // a push camera may legitimately have nothing to report for far longer than
-                // that, so a successful renew counts as listener activity.
-                events.emit('data', 'onvif push subscription renewed');
-                scheduleRenew(delay);
+                accepted(await client.pushRenew(), 'renewed');
+                return;
             }
             catch (e) {
                 if (destroyed)
                     return;
+                thisDevice.console.warn('onvif push renew rejected, replacing subscription:', e.message || e);
+            }
+
+            // The camera refused to extend the lease. A camera that has restarted, or has
+            // otherwise forgotten the subscription, faults every Renew while still honouring a
+            // fresh Subscribe, so retrying the renewal only burns the rest of the lease.
+            // Replace the subscription instead. The consumer url is unchanged, so the camera
+            // keeps posting to the same callback.
+            try {
+                await client.unsubscribe().catch(() => { });
+                if (destroyed)
+                    return;
+                accepted(await client.pushSubscribe(callbackUrl), 'replaced');
+            }
+            catch (e) {
+                if (destroyed)
+                    return;
+                failures++;
                 const remaining = leaseExpires - Date.now();
-                if (remaining > RENEW_RETRY_MS) {
-                    thisDevice.console.warn(`onvif push renew failed, retrying; lease expires in ${Math.round(remaining / 1000)}s`, e);
+                if (failures < MAX_SUBSCRIBE_FAILURES && remaining > RENEW_RETRY_MS) {
+                    thisDevice.console.warn(`onvif push resubscribe failed, retrying; lease expires in ${Math.round(remaining / 1000)}s`, e.message || e);
                     scheduleRenew(RENEW_RETRY_MS);
                     return;
                 }
-                // the lease is gone. tear down rather than stacking a second subscription on
-                // top of the existing one, and let the listen loop rebuild from scratch.
-                thisDevice.console.error('onvif push subscription lost, reconnecting', e);
+                // out of options. tear down rather than stacking subscriptions, and let the
+                // listen loop rebuild from scratch.
+                thisDevice.console.error('onvif push subscription lost, reconnecting', e.message || e);
                 events.emit('error', e);
             }
         };
 
         try {
-            const lease = await client.pushSubscribe(callbackUrl);
-            leaseExpires = Date.now() + lease;
-            const delay = computeRenewDelay(lease);
-            thisDevice.console.log(`onvif push subscription active; lease=${Math.round(lease / 1000)}s; renew in=${Math.round(delay / 1000)}s`);
-            scheduleRenew(delay);
+            accepted(await client.pushSubscribe(callbackUrl), 'active');
         }
         catch (e) {
             // the Destroyable is never returned when subscribe fails, so clean up the callback
