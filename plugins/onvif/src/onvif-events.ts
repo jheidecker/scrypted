@@ -16,6 +16,21 @@ export interface OnvifPushOptions {
     unregister(): void;
 }
 
+/**
+ * 'motion' is the camera's own motion rule. Any other value is an object detection class, and
+ * a detection of that class will also set the motion sensor.
+ */
+export type OnvifMotionEvent = 'motion' | string;
+
+export interface OnvifListenOptions {
+    push?: OnvifPushOptions;
+    /**
+     * Which events set the camera's motion sensor. Defaults to the camera's own motion rule,
+     * which is the behavior of any caller that does not configure this.
+     */
+    motionEvents?: OnvifMotionEvent[];
+}
+
 // renew comfortably before the lease expires, derived from the lease the camera actually
 // accepted rather than its wall clock.
 const RENEW_LEASE_FRACTION = 0.65;
@@ -29,7 +44,12 @@ function computeRenewDelay(leaseMs: number) {
     return Math.min(Math.max(leaseMs * RENEW_LEASE_FRACTION, MIN_RENEW_MS), MAX_RENEW_MS);
 }
 
-export async function listenEvents(thisDevice: ScryptedDeviceBase, client: OnvifCameraAPI, motionTimeoutMs = 30000, push?: OnvifPushOptions) {
+export async function listenEvents(thisDevice: ScryptedDeviceBase, client: OnvifCameraAPI, motionTimeoutMs = 30000, options?: OnvifListenOptions) {
+    const push = options?.push;
+    // an empty or absent selection keeps the historical behavior: only the camera's own motion
+    // rule drives the motion sensor.
+    const motionEvents = options?.motionEvents?.length ? options.motionEvents : ['motion'];
+    const motionOnMotion = motionEvents.includes('motion');
     let motionTimeout: NodeJS.Timeout;
     let binaryTimeout: NodeJS.Timeout;
     let renewTimeout: NodeJS.Timeout;
@@ -163,7 +183,8 @@ export async function listenEvents(thisDevice: ScryptedDeviceBase, client: Onvif
     events.on('event', (event, className) => {
         if (event === OnvifEvent.MotionBuggy) {
             // some onvif cameras have motion with no associated motion end event.
-            triggerMotion();
+            if (motionOnMotion)
+                triggerMotion();
             return;
         }
         if (event === OnvifEvent.BinaryRingEvent) {
@@ -178,12 +199,13 @@ export async function listenEvents(thisDevice: ScryptedDeviceBase, client: Onvif
             // events.
             // furthermore, cameras are not guaranteed to send motion stop events, which makes.
             // for the sake of providing normalized motion durations through scrypted, debounce the motion.
-            triggerMotion();
+            if (motionOnMotion)
+                triggerMotion();
             // thisDevice.motionDetected = true;
         }
         else if (event === OnvifEvent.MotionStop) {
             // reset the trigger to debounce per above.
-            if (thisDevice.motionDetected)
+            if (motionOnMotion && thisDevice.motionDetected)
                 triggerMotion();
 
             // thisDevice.motionDetected = false;
@@ -197,6 +219,10 @@ export async function listenEvents(thisDevice: ScryptedDeviceBase, client: Onvif
         else if (event === OnvifEvent.BinaryStop)
             thisDevice.binaryState = false;
         else if (event === OnvifEvent.Detection) {
+            // a camera whose motion rule is noisy, or which never sends one, can drive the
+            // motion sensor from a detection class instead.
+            if (className && motionEvents.includes(className))
+                triggerMotion();
             const d: ObjectsDetected = {
                 // the camera supplied UtcTime is unreliable on some firmware, so scrypted
                 // events are always stamped with the local receive time.

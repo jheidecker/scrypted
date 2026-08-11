@@ -7,7 +7,7 @@ import xml2js from 'xml2js';
 import { RtspProvider, RtspSmartCamera, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
 import { connectCameraAPI, OnvifCameraAPI, OnvifEvent } from "./onvif-api";
 import { autoconfigureSettings, configureCodecs, getCodecs } from "./onvif-configure";
-import { listenEvents, OnvifEventTransport, OnvifPushOptions } from "./onvif-events";
+import { listenEvents, OnvifEventTransport, OnvifListenOptions, OnvifPushOptions } from "./onvif-events";
 import { OnvifIntercom } from "./onvif-intercom";
 import { OnvifPTZMixinProvider } from "./onvif-ptz";
 import { automaticallyConfigureSettings, checkPluginNeedsAutoConfigure, onvifAutoConfigureSettings } from "@scrypted/common/src/autoconfigure-codecs";
@@ -19,6 +19,10 @@ const TRANSPORT_CHOICES: { [choice: string]: OnvifEventTransport } = {
     'PullPoint': 'pullpoint',
     'Push (WS-BaseNotification)': 'push',
 };
+
+function toChoice(event: string) {
+    return event.charAt(0).toUpperCase() + event.slice(1);
+}
 
 function safeEquals(a: string, b: string) {
     if (typeof a !== 'string' || typeof b !== 'string')
@@ -348,6 +352,21 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
         return [];
     }
 
+    /**
+     * The events that set this camera's motion sensor. Defaults to the camera's own motion
+     * rule, which is the historical behavior.
+     */
+    getMotionEvents(): string[] {
+        try {
+            const events = JSON.parse(this.storage.getItem('onvifMotionEvents'));
+            if (Array.isArray(events) && events.length)
+                return events;
+        }
+        catch (e) {
+        }
+        return ['motion'];
+    }
+
     async listenEvents() {
         const client = await this.createClient();
         try {
@@ -356,12 +375,20 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
                 this.storage.setItem('onvifDetector', 'true');
                 this.updateDevice();
             }
+            // persist the advertised classes so they can be selected in settings without
+            // waiting for the camera to report one, and without a live connection.
+            for (const className of eventTypes || [])
+                this.addDetectionClass(className);
         }
         catch (e) {
         }
 
         const transport = this.getEventTransport();
-        const ret = await listenEvents(this, client, 30000, transport === 'pullpoint' ? undefined : this.createPushOptions());
+        const options: OnvifListenOptions = {
+            push: transport === 'pullpoint' ? undefined : this.createPushOptions(),
+            motionEvents: this.getMotionEvents(),
+        };
+        const ret = await listenEvents(this, client, 30000, options);
 
         ret.on('event', (event: OnvifEvent, className: string) => {
             if (event === OnvifEvent.Detection && className)
@@ -445,6 +472,22 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
             value: Object.keys(TRANSPORT_CHOICES).find(choice => TRANSPORT_CHOICES[choice] === transport),
         });
 
+        const motionEvents = this.getMotionEvents();
+        // the camera accessory in HomeKit, and other consumers that only understand a motion
+        // sensor, can be pointed at a detection class instead of the camera's motion rule.
+        // persisted rather than queried, so an unreachable camera cannot stall the settings page.
+        const motionChoices = ['motion', ...this.getStoredDetectionClasses()];
+        ret.push({
+            subgroup: 'Advanced',
+            title: 'Motion Sensor Events',
+            description: 'Which camera events set the motion sensor. Defaults to the motion rule. Selecting a detection class instead is useful for consumers that only understand a motion sensor, such as the HomeKit camera accessory.',
+            type: 'string',
+            key: 'onvifMotionEvents',
+            multiple: true,
+            choices: motionChoices.map(toChoice),
+            value: motionEvents.map(toChoice),
+        });
+
         if (this.pushToken) {
             ret.push({
                 subgroup: 'Advanced',
@@ -510,6 +553,15 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
         this.rtspMediaStreamOptions = undefined;
 
         this.updateDeviceInfo();
+
+        if (key === 'onvifMotionEvents') {
+            const selected = (Array.isArray(value) ? value : [value])
+                .map(choice => `${choice}`.toLowerCase())
+                .filter(choice => !!choice);
+            this.storage.setItem(key, JSON.stringify(selected));
+            this.listener?.then(l => l.emit('error', new Error("new settings")));
+            return;
+        }
 
         if (key === 'onvifEventTransport') {
             // the setting presents display names, so normalize to the stored value rather than
