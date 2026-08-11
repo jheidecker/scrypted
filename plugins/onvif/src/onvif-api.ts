@@ -23,7 +23,7 @@ export enum OnvifEvent {
     DigitalInputStop,
 }
 
-function stripNamespaces(topic: string) {
+export function stripNamespaces(topic: string) {
     // example input :-   tns1:MediaControl/tnsavg:ConfigurationUpdateAudioEncCfg 
     // Split on '/'
     // For each part, remove any namespace
@@ -39,6 +39,37 @@ function stripNamespaces(topic: string) {
         }
     }
     return output
+}
+
+function ensureArray<T>(value: T | T[]): T[] {
+    if (value === undefined || value === null)
+        return [];
+    return Array.isArray(value) ? value : [value];
+}
+
+/**
+ * ONVIF xs:boolean permits "true"/"false" as well as "1"/"0", which linerase turns into booleans
+ * and numbers respectively. Values that are neither, such as the Mobotix "Ring", are not booleans
+ * and must not be coerced.
+ */
+function isTrue(value: any) {
+    return value === true || value === 1;
+}
+
+/**
+ * An ONVIF tt:Source or tt:Data node may contain multiple tt:SimpleItem entries. The onvif
+ * library's linerase collapses a single entry into an object and multiple entries into an
+ * array, so normalize both shapes into a name/value dictionary.
+ *
+ * linerase has already coerced the attribute values, so "true"/"false" arrive as booleans and
+ * numeric strings arrive as numbers.
+ */
+function normalizeSimpleItems(node: any) {
+    const items = ensureArray(node?.simpleItem).filter((item: any) => item?.$?.Name !== undefined);
+    const values: Record<string, any> = {};
+    for (const item of items)
+        values[item.$.Name] = item.$.Value;
+    return { items, values };
 }
 
 async function promisify<T>(block: (callback: (err: Error, value: T) => void) => void): Promise<T> {
@@ -57,6 +88,7 @@ export class OnvifCameraAPI {
     binaryStateEvent: string;
     credential: AuthFetchCredentialState;
     detections: Map<string, string>;
+    loggedUnknownProperties = new Set<string>();
 
     constructor(public cam: any, username: string, password: string, public console: Console, binaryStateEvent: string) {
         this.binaryStateEvent = binaryStateEvent
@@ -94,78 +126,115 @@ export class OnvifCameraAPI {
     listenEvents() {
         const ret = new EventEmitter();
 
-        this.cam.on('event', (event: any, xml: string) => {
-            ret.emit('data', xml);
-
-            if (!event.message.message.data?.simpleItem?.$)
-                return;
-
-            const dataValue = event.message.message.data.simpleItem.$.Value;
-            const eventTopic = stripNamespaces(event.topic._);
-
-            ret.emit('onvifEvent', eventTopic, dataValue);
-
-            if (eventTopic.includes('MotionAlarm')) {
-                // ret.emit('event', OnvifEvent.MotionBuggy);
-                if (dataValue)
-                    ret.emit('event', OnvifEvent.MotionStart)
-                else
-                    ret.emit('event', OnvifEvent.MotionStop)
-            }
-            else if (eventTopic.includes('DetectedSound')) {
-                if (dataValue)
-                    ret.emit('event', OnvifEvent.AudioStart)
-                else
-                    ret.emit('event', OnvifEvent.AudioStop)
-            }
-            // Reolink
-            else if (eventTopic.includes('Visitor') && (dataValue === true || dataValue === false)) {
-                if (dataValue) {
-                    ret.emit('event', OnvifEvent.BinaryStart)
-                }
-                else {
-                    ret.emit('event', OnvifEvent.BinaryStop)
-                }
-            }
-            // Mobotix T26
-            else if (eventTopic.includes('VideoSource/Alarm')) {
-                if (dataValue === "Ring" || dataValue === "CameraBellButton") {
-                    ret.emit('event', OnvifEvent.BinaryRingEvent);
-                }
-            }
-            // else if (eventTopic.includes('DigitalInput')) {
-            //     if (dataValue)
-            //         ret.emit('event', OnvifEvent.BinaryStart)
-            //     else
-            //         ret.emit('event', OnvifEvent.BinaryStop)
-            // }
-            else if (this.binaryStateEvent && eventTopic.includes(this.binaryStateEvent)) {
-                if (dataValue)
-                    ret.emit('event', OnvifEvent.BinaryStart)
-                else
-                    ret.emit('event', OnvifEvent.BinaryStop)
-            }
-            else if (eventTopic.includes('RuleEngine/CellMotionDetector/Motion')) {
-                // unclear if the IsMotion false is indicative of motion stop?
-                if (event.message.message.data.simpleItem.$.Name === 'IsMotion' && dataValue) {
-                    ret.emit('event', OnvifEvent.MotionBuggy);
-                }
-            }
-            else if (eventTopic.includes('RuleEngine/ObjectDetector')) {
-                if (dataValue) {
-                    try {
-                        const eventName = event.message.message.data.simpleItem.$.Name;
-                        const className = this.detections.get(eventName);
-                        this.console.log('object detected:', className);
-                        ret.emit('event', OnvifEvent.Detection, className);
-                    }
-                    catch (e) {
-                        this.console.warn('error parsing detection', e);
-                    }
-                }
-            }
-        });
+        this.cam.on('event', (event: any, xml: string) => this.handleNotification(ret, event, xml));
         return ret;
+    }
+
+    /**
+     * Classifies a single ONVIF notification message. This is shared by both event transports:
+     * PullPoint delivers messages through the onvif library's 'event' emitter, while
+     * WS-BaseNotification push delivers them through the camera's HTTP callback. Both produce
+     * the same linerased message shape, so semantics do not diverge between transports.
+     */
+    handleNotification(ret: EventEmitter, event: any, xml: string) {
+        ret.emit('data', xml);
+
+        const message = event?.message?.message;
+        const topic = event?.topic?._;
+        if (!message || typeof topic !== 'string')
+            return;
+
+        const { items: dataItems, values: data } = normalizeSimpleItems(message.data);
+        if (!dataItems.length)
+            return;
+
+        // retained so the single valued handling below is unchanged for existing cameras.
+        const dataValue = dataItems[0].$.Value;
+        const eventTopic = stripNamespaces(topic);
+        const operation = message.$?.PropertyOperation;
+
+        ret.emit('onvifEvent', eventTopic, dataValue);
+
+        if (eventTopic.includes('MotionAlarm')) {
+            // ret.emit('event', OnvifEvent.MotionBuggy);
+            if (dataValue)
+                ret.emit('event', OnvifEvent.MotionStart)
+            else
+                ret.emit('event', OnvifEvent.MotionStop)
+        }
+        else if (eventTopic.includes('DetectedSound')) {
+            if (dataValue)
+                ret.emit('event', OnvifEvent.AudioStart)
+            else
+                ret.emit('event', OnvifEvent.AudioStop)
+        }
+        // Reolink
+        else if (eventTopic.includes('Visitor') && (dataValue === true || dataValue === false)) {
+            if (dataValue) {
+                ret.emit('event', OnvifEvent.BinaryStart)
+            }
+            else {
+                ret.emit('event', OnvifEvent.BinaryStop)
+            }
+        }
+        // Mobotix T26
+        else if (eventTopic.includes('VideoSource/Alarm')) {
+            if (dataValue === "Ring" || dataValue === "CameraBellButton") {
+                ret.emit('event', OnvifEvent.BinaryRingEvent);
+            }
+        }
+        // else if (eventTopic.includes('DigitalInput')) {
+        //     if (dataValue)
+        //         ret.emit('event', OnvifEvent.BinaryStart)
+        //     else
+        //         ret.emit('event', OnvifEvent.BinaryStop)
+        // }
+        else if (this.binaryStateEvent && eventTopic.includes(this.binaryStateEvent)) {
+            if (dataValue)
+                ret.emit('event', OnvifEvent.BinaryStart)
+            else
+                ret.emit('event', OnvifEvent.BinaryStop)
+        }
+        else if (eventTopic.includes('RuleEngine/CellMotionDetector/Motion')) {
+            // unclear if the IsMotion false is indicative of motion stop?
+            if (isTrue(data.IsMotion)) {
+                ret.emit('event', OnvifEvent.MotionBuggy);
+            }
+        }
+        else if (eventTopic.includes('RuleEngine/ObjectDetector')) {
+            // an Initialized notification reports the current state of the rule rather than a
+            // new detection, and must not surface as a user facing object detection.
+            if (operation !== 'Initialized') {
+                for (const [eventName, value] of Object.entries(data)) {
+                    if (!isTrue(value))
+                        continue;
+                    const className = this.detections?.get(eventName);
+                    if (!className) {
+                        this.logUnknownProperty(eventTopic, eventName);
+                        continue;
+                    }
+                    this.console.log('object detected:', className);
+                    ret.emit('event', OnvifEvent.Detection, className);
+                }
+            }
+        }
+        else {
+            for (const eventName of Object.keys(data))
+                this.logUnknownProperty(eventTopic, eventName);
+        }
+    }
+
+    /**
+     * Vendor firmware may emit properties that are not described by GetEventProperties, so
+     * unrecognized fields are reported rather than silently dropped. Log once per topic and
+     * property to avoid spamming the console on every notification.
+     */
+    logUnknownProperty(eventTopic: string, eventName: string) {
+        const key = `${eventTopic}/${eventName}`;
+        if (this.loggedUnknownProperties.has(key))
+            return;
+        this.loggedUnknownProperties.add(key);
+        this.console.log('unhandled onvif event property:', key);
     }
 
     async canConfigureEncoding() {
