@@ -41,6 +41,9 @@ export function stripNamespaces(topic: string) {
     return output
 }
 
+// the onvif library always requests a PT2M lease for both Subscribe and Renew.
+const DEFAULT_LEASE_MS = 120000;
+
 function ensureArray<T>(value: T | T[]): T[] {
     if (value === undefined || value === null)
         return [];
@@ -128,6 +131,77 @@ export class OnvifCameraAPI {
 
         this.cam.on('event', (event: any, xml: string) => this.handleNotification(ret, event, xml));
         return ret;
+    }
+
+    /**
+     * Creates the event emitter for the WS-BaseNotification push transport.
+     *
+     * Unlike listenEvents, this deliberately does not add an 'event' listener to the camera:
+     * the onvif library starts a PullPoint subscription as soon as the first one is added, and
+     * PullPoint and Base Notification share the same cam.events.subscription state. Only one of
+     * the two transports may be active on a given client.
+     */
+    listenPushEvents() {
+        return new EventEmitter();
+    }
+
+    /**
+     * Parses the body of a Notify message posted by the camera and dispatches it through the
+     * same classifier as PullPoint. A single POST may carry multiple NotificationMessages.
+     */
+    async handlePushXml(ret: EventEmitter, xml: string) {
+        let messages: any[];
+        try {
+            // parseEventXML throws rather than reporting an error for a body that is not a
+            // well formed Notify envelope.
+            messages = ensureArray(await promisify<any>(cb => this.cam.parseEventXML(xml, cb)));
+        }
+        catch (e) {
+            this.console.warn('error parsing onvif push notification', e);
+            return;
+        }
+
+        for (const message of messages) {
+            try {
+                this.handleNotification(ret, message, xml);
+            }
+            catch (e) {
+                this.console.warn('error handling onvif push notification', e);
+            }
+        }
+    }
+
+    /**
+     * Creates a WS-BaseNotification subscription. The camera will POST Notify messages to the
+     * supplied consumer url. Returns the accepted lease duration in milliseconds.
+     */
+    async pushSubscribe(url: string): Promise<number> {
+        const subscription = await promisify<any>(cb => this.cam.subscribe({ url }, cb));
+        return this.updateTerminationTime(subscription);
+    }
+
+    /**
+     * Renews the current subscription. The onvif library always requests PT2M and does not
+     * store the response, so the termination time is recomputed and assigned here.
+     */
+    async pushRenew(): Promise<number> {
+        const renewal = await promisify<any>(cb => this.cam.renew({}, cb));
+        return this.updateTerminationTime(renewal);
+    }
+
+    /**
+     * Returns the accepted lease duration in milliseconds. The camera's absolute clock is not
+     * trusted: only the relative difference between the current and termination time it reports
+     * is used, and that duration is applied to the local clock.
+     */
+    updateTerminationTime(response: any) {
+        let lease = DEFAULT_LEASE_MS;
+        const currentTime = response?.currentTime?.getTime?.();
+        const terminationTime = response?.terminationTime?.getTime?.();
+        if (currentTime !== undefined && terminationTime !== undefined && terminationTime > currentTime)
+            lease = terminationTime - currentTime;
+        this.cam.events.terminationTime = new Date(Date.now() + lease);
+        return lease;
     }
 
     /**

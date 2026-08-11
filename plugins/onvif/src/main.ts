@@ -1,4 +1,5 @@
-import sdk, { AdoptDevice, Device, DeviceCreatorSettings, DeviceDiscovery, DeviceInformation, DiscoveredDevice, Intercom, MediaObject, MediaStreamOptions, ObjectDetectionTypes, ObjectDetector, PictureOptions, Reboot, RequestPictureOptions, ScryptedDeviceType, ScryptedInterface, ScryptedNativeId, Setting, SettingValue, VideoCamera, VideoCameraConfiguration, VideoTextOverlay, VideoTextOverlays } from "@scrypted/sdk";
+import sdk, { AdoptDevice, Device, DeviceCreatorSettings, DeviceDiscovery, DeviceInformation, DiscoveredDevice, HttpRequest, HttpRequestHandler, HttpResponse, Intercom, MediaObject, MediaStreamOptions, ObjectDetectionTypes, ObjectDetector, PictureOptions, Reboot, RequestPictureOptions, ScryptedDeviceType, ScryptedInterface, ScryptedNativeId, Setting, SettingValue, VideoCamera, VideoCameraConfiguration, VideoTextOverlay, VideoTextOverlays } from "@scrypted/sdk";
+import crypto from 'crypto';
 import { AddressInfo } from "net";
 import onvif from 'onvif';
 import { Stream } from "stream";
@@ -6,18 +7,43 @@ import xml2js from 'xml2js';
 import { RtspProvider, RtspSmartCamera, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
 import { connectCameraAPI, OnvifCameraAPI } from "./onvif-api";
 import { autoconfigureSettings, configureCodecs, getCodecs } from "./onvif-configure";
-import { listenEvents } from "./onvif-events";
+import { listenEvents, OnvifEventTransport, OnvifPushOptions } from "./onvif-events";
 import { OnvifIntercom } from "./onvif-intercom";
 import { OnvifPTZMixinProvider } from "./onvif-ptz";
 import { automaticallyConfigureSettings, checkPluginNeedsAutoConfigure, onvifAutoConfigureSettings } from "@scrypted/common/src/autoconfigure-codecs";
 
-const { mediaManager, systemManager, deviceManager } = sdk;
+const { endpointManager, mediaManager, systemManager, deviceManager } = sdk;
 
-class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, VideoCameraConfiguration, Reboot, VideoTextOverlays {
+const TRANSPORT_CHOICES: { [choice: string]: OnvifEventTransport } = {
+    'Auto': 'auto',
+    'PullPoint': 'pullpoint',
+    'Push (WS-BaseNotification)': 'push',
+};
+
+function safeEquals(a: string, b: string) {
+    if (typeof a !== 'string' || typeof b !== 'string')
+        return false;
+    if (a.length !== b.length)
+        return false;
+    let mismatch = 0;
+    for (let i = 0; i < a.length; i++)
+        mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return mismatch === 0;
+}
+
+class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, VideoCameraConfiguration, Reboot, VideoTextOverlays, HttpRequestHandler {
     eventStream: Stream;
     client: OnvifCameraAPI;
     rtspMediaStreamOptions: Promise<UrlMediaStreamOptions[]>;
     intercom = new OnvifIntercom(this);
+    /**
+     * Identifies the current push subscription's callback. This is deliberately not persisted:
+     * a plugin reload invalidates it, so a late POST from a camera holding a stale subscription
+     * is rejected rather than resurrecting torn down state.
+     */
+    pushToken: string;
+    pushHandler: (xml: string) => void;
+    loggedPushContentType = false;
 
     constructor(nativeId: string, provider: RtspProvider) {
         super(nativeId, provider);
@@ -183,6 +209,114 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
     }
 
 
+    getEventTransport(): OnvifEventTransport {
+        const transport = this.storage.getItem('onvifEventTransport') as OnvifEventTransport;
+        if (transport === 'pullpoint' || transport === 'push')
+            return transport;
+        return 'auto';
+    }
+
+    /**
+     * Whether this camera should expose the push callback endpoint. Auto only needs it once it
+     * has actually fallen back to push, so cameras happily using PullPoint do not report an
+     * endpoint they will never receive anything on.
+     */
+    pushEndpointEnabled() {
+        return this.getEventTransport() === 'push'
+            || this.storage.getItem('onvifPushFallback') === 'true';
+    }
+
+    async getPushCallbackUrl() {
+        // the endpoint must be public because the camera cannot authenticate with scrypted, and
+        // insecure because cameras generally will not trust scrypted's self signed certificate.
+        const endpoint = await endpointManager.getLocalEndpoint(this.nativeId, {
+            public: true,
+            insecure: true,
+        });
+        return `${endpoint}push/${this.pushToken}`;
+    }
+
+    createPushOptions(): OnvifPushOptions {
+        return {
+            transport: this.getEventTransport(),
+            getCallbackUrl: async () => {
+                // the server only routes the camera's post to this device if it reports the
+                // interface, so make sure that has happened before handing out the url.
+                if (!this.pushEndpointEnabled()) {
+                    this.storage.setItem('onvifPushFallback', 'true');
+                    await this.updateDevice();
+                }
+                this.pushToken = crypto.randomBytes(16).toString('hex');
+                return this.getPushCallbackUrl();
+            },
+            register: handler => this.pushHandler = handler,
+            unregister: () => {
+                this.pushHandler = undefined;
+                this.pushToken = undefined;
+            },
+        };
+    }
+
+    /**
+     * Receives WS-BaseNotification Notify messages posted by the camera.
+     */
+    async onRequest(request: HttpRequest, response: HttpResponse): Promise<void> {
+        // respond immediately. the camera must not be made to wait on downstream scrypted work,
+        // and the request body has already been read by the server.
+        const path = request.url.substring(request.rootPath.length).split('?')[0];
+        const [, route, token] = path.split('/');
+
+        if (route !== 'push') {
+            response.send('Not Found', { code: 404 });
+            return;
+        }
+        if (request.method !== 'POST') {
+            response.send('Method Not Allowed', { code: 405 });
+            return;
+        }
+        if (!this.pushHandler || !this.pushToken || !safeEquals(token, this.pushToken)) {
+            // an expired or unknown subscription. the camera should stop posting once its
+            // lease lapses.
+            response.send('Gone', { code: 410 });
+            return;
+        }
+
+        response.send('ok', { code: 200 });
+
+        try {
+            const xml = this.decodePushBody(request);
+            if (xml)
+                this.pushHandler(xml);
+        }
+        catch (e) {
+            this.console.warn('error handling onvif push callback', e);
+        }
+    }
+
+    /**
+     * The scrypted server parses endpoint request bodies before the plugin sees them. An ONVIF
+     * Notify is posted as application/soap+xml, which the server's raw body parser turns into a
+     * Buffer and then serializes as JSON, so unwrap that here.
+     */
+    decodePushBody(request: HttpRequest) {
+        const body = request.body;
+        if (!body)
+            return;
+        if (body.trimStart().startsWith('<'))
+            return body;
+        try {
+            const parsed = JSON.parse(body);
+            if (parsed?.type === 'Buffer' && Array.isArray(parsed.data))
+                return Buffer.from(parsed.data).toString('utf8');
+        }
+        catch (e) {
+        }
+        if (!this.loggedPushContentType) {
+            this.loggedPushContentType = true;
+            this.console.warn('onvif push callback body could not be decoded. content-type:', request.headers?.['content-type']);
+        }
+    }
+
     async listenEvents() {
         const client = await this.createClient();
         try {
@@ -195,7 +329,10 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
         catch (e) {
         }
 
-        return listenEvents(this, client);
+        const transport = this.getEventTransport();
+        const ret = await listenEvents(this, client, 30000, transport === 'pullpoint' ? undefined : this.createPushOptions());
+
+        return ret;
     }
 
     createClient() {
@@ -261,6 +398,29 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
             )
         }
 
+        const transport = this.getEventTransport();
+        ret.push({
+            subgroup: 'Advanced',
+            title: 'ONVIF Event Transport',
+            description: 'The mechanism used to receive events from the camera. Auto uses PullPoint and only falls back to Push if the PullPoint subscription cannot be created. Some cameras, such as current Tapo firmware, accept a PullPoint subscription but never deliver events, and require Push.',
+            type: 'string',
+            key: 'onvifEventTransport',
+            choices: Object.keys(TRANSPORT_CHOICES),
+            value: Object.keys(TRANSPORT_CHOICES).find(choice => TRANSPORT_CHOICES[choice] === transport),
+        });
+
+        if (this.pushToken) {
+            ret.push({
+                subgroup: 'Advanced',
+                title: 'ONVIF Push Callback',
+                description: 'The address the camera posts events to. It must be reachable from the camera network.',
+                type: 'string',
+                key: 'onvifPushCallbackUrl',
+                readonly: true,
+                value: await this.getPushCallbackUrl(),
+            });
+        }
+
         const ac = {
             ...automaticallyConfigureSettings,
             subgroup: 'Advanced',
@@ -279,6 +439,8 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
         const interfaces: string[] = [...this.provider.getInterfaces()];
         if (this.storage.getItem('onvifDetector') === 'true')
             interfaces.push(ScryptedInterface.ObjectDetector);
+        if (this.pushEndpointEnabled())
+            interfaces.push(ScryptedInterface.HttpRequestHandler);
         const doorbell = this.storage.getItem('onvifDoorbell') === 'true';
         let type: ScryptedDeviceType;
         if (doorbell) {
@@ -290,8 +452,9 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
         if (twoWay || doorbell)
             interfaces.push(ScryptedInterface.Intercom);
 
-        this.provider.updateDevice(this.nativeId, this.name, interfaces, type);
+        const updated = this.provider.updateDevice(this.nativeId, this.name, interfaces, type);
         this.onDeviceEvent(ScryptedInterface.Settings, undefined);
+        return updated;
     }
 
     async putSetting(key: string, value: any) {
@@ -311,6 +474,20 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
         this.rtspMediaStreamOptions = undefined;
 
         this.updateDeviceInfo();
+
+        if (key === 'onvifEventTransport') {
+            // the setting presents display names, so normalize to the stored value rather than
+            // letting the base class persist the label.
+            this.storage.setItem(key, TRANSPORT_CHOICES[value as string] || 'auto');
+            // an explicit choice supersedes any earlier automatic fallback.
+            this.storage.removeItem('onvifPushFallback');
+            // report the endpoint interface before the listener restarts and generates the
+            // callback url, otherwise the server will not route the camera's post.
+            this.updateDevice();
+            // restart the event listener, as RtspSmartCamera.putSetting would have.
+            this.listener?.then(l => l.emit('error', new Error("new settings")));
+            return;
+        }
 
         if (key !== 'onvifDoorbell' && key !== 'onvifTwoWay')
             return super.putSetting(key, value);
