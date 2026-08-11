@@ -97,6 +97,11 @@ export class OnvifCameraAPI {
      * topics and properties a camera actually reports, which is not always what it advertised.
      */
     debugEvents = false;
+    /**
+     * Optional sink for the normalized debug records, so the owning device can persist them
+     * without pulling filesystem access into the shared event code.
+     */
+    onDebugEvent: (record: any) => void;
 
     constructor(public cam: any, username: string, password: string, public console: Console, binaryStateEvent: string) {
         this.binaryStateEvent = binaryStateEvent
@@ -233,16 +238,18 @@ export class OnvifCameraAPI {
         const operation = message.$?.PropertyOperation;
 
         if (this.debugEvents) {
-            // the camera supplied time is logged alongside the local receive time because some
-            // firmware reuses a stale value, and only the local time is trustworthy.
-            this.console.log('onvif event:', JSON.stringify({
+            // the camera supplied time is recorded alongside the local receive time because
+            // some firmware reuses a stale value, and only the local time is trustworthy.
+            const record = {
                 topic: eventTopic,
                 operation,
                 source: normalizeSimpleItems(message.source).values,
                 data,
                 cameraUtcTime: message.$?.UtcTime,
                 receivedAt: new Date().toISOString(),
-            }));
+            };
+            this.console.log('onvif event:', JSON.stringify(record));
+            this.onDebugEvent?.(record);
         }
 
         ret.emit('onvifEvent', eventTopic, dataValue);

@@ -1,5 +1,7 @@
 import sdk, { AdoptDevice, Device, DeviceCreatorSettings, DeviceDiscovery, DeviceInformation, DiscoveredDevice, HttpRequest, HttpRequestHandler, HttpResponse, Intercom, MediaObject, MediaStreamOptions, ObjectDetectionTypes, ObjectDetector, PictureOptions, Reboot, RequestPictureOptions, ScryptedDeviceType, ScryptedInterface, ScryptedNativeId, Setting, SettingValue, VideoCamera, VideoCameraConfiguration, VideoTextOverlay, VideoTextOverlays } from "@scrypted/sdk";
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { AddressInfo } from "net";
 import onvif from 'onvif';
 import { Stream } from "stream";
@@ -13,6 +15,10 @@ import { OnvifPTZMixinProvider } from "./onvif-ptz";
 import { automaticallyConfigureSettings, checkPluginNeedsAutoConfigure, onvifAutoConfigureSettings } from "@scrypted/common/src/autoconfigure-codecs";
 
 const { endpointManager, mediaManager, systemManager, deviceManager } = sdk;
+
+// a shared file rather than one per camera, so a single grep covers the whole system.
+const EVENT_LOG_FILE = 'onvif-events.log';
+const EVENT_LOG_MAX_BYTES = 16 * 1024 * 1024;
 
 const TRANSPORT_CHOICES: { [choice: string]: OnvifEventTransport } = {
     'Auto': 'auto',
@@ -50,6 +56,8 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
     pushToken: string;
     pushHandler: (xml: string) => void;
     loggedPushContentType = false;
+    loggedEventLogPath = false;
+    eventLogWrites = Promise.resolve();
 
     constructor(nativeId: string, provider: RtspProvider) {
         super(nativeId, provider);
@@ -414,7 +422,39 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
     async createClient() {
         const client = await connectCameraAPI(this.getHttpAddress(), this.getUsername(), this.getPassword(), this.console, this.storage.getItem('onvifDoorbellEvent'));
         client.debugEvents = this.storage.getItem('onvifEventDebug') === 'true';
+        if (client.debugEvents)
+            client.onDebugEvent = record => this.appendEventLog(record);
         return client;
+    }
+
+    /**
+     * Appends a debug record to a shared file in the plugin volume. The management console only
+     * keeps a capped in memory buffer, so a survey of what a camera reports needs somewhere it
+     * can be read back from and searched later.
+     */
+    appendEventLog(record: any) {
+        const volume = process.env.SCRYPTED_PLUGIN_VOLUME;
+        if (!volume)
+            return;
+        const file = path.join(volume, EVENT_LOG_FILE);
+        if (!this.loggedEventLogPath) {
+            this.loggedEventLogPath = true;
+            this.console.log('logging onvif events to', file);
+        }
+        const line = JSON.stringify({
+            camera: this.name,
+            id: this.id,
+            ...record,
+        }) + '\n';
+        // serialized per camera so a slow write cannot interleave this camera's own records.
+        this.eventLogWrites = this.eventLogWrites
+            .then(async () => {
+                const stat = await fs.promises.stat(file).catch(() => undefined);
+                if (stat && stat.size > EVENT_LOG_MAX_BYTES)
+                    await fs.promises.rename(file, `${file}.1`).catch(() => { });
+                await fs.promises.appendFile(file, line);
+            })
+            .catch(e => this.console.warn('unable to write the onvif event log', e.message || e));
     }
 
     async getClient() {
