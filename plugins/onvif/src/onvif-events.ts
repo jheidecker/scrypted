@@ -46,9 +46,9 @@ function computeRenewDelay(leaseMs: number) {
 
 export async function listenEvents(thisDevice: ScryptedDeviceBase, client: OnvifCameraAPI, motionTimeoutMs = 30000, options?: OnvifListenOptions) {
     const push = options?.push;
-    // an empty or absent selection keeps the historical behavior: only the camera's own motion
-    // rule drives the motion sensor.
-    const motionEvents = options?.motionEvents?.length ? options.motionEvents : ['motion'];
+    // an absent selection keeps the historical behavior of using the camera's own motion rule.
+    // an explicitly empty selection is a valid choice that leaves the motion sensor unused.
+    const motionEvents = options?.motionEvents ?? ['motion'];
     const motionOnMotion = motionEvents.includes('motion');
     let motionTimeout: NodeJS.Timeout;
     let binaryTimeout: NodeJS.Timeout;

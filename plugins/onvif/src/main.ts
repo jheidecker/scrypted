@@ -357,12 +357,17 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
      * rule, which is the historical behavior.
      */
     getMotionEvents(): string[] {
-        try {
-            const events = JSON.parse(this.storage.getItem('onvifMotionEvents'));
-            if (Array.isArray(events) && events.length)
-                return events;
-        }
-        catch (e) {
+        const stored = this.storage.getItem('onvifMotionEvents');
+        if (stored) {
+            try {
+                const events = JSON.parse(stored);
+                // an empty selection is a deliberate choice, not an unset value, and must not
+                // fall back to the default.
+                if (Array.isArray(events))
+                    return events.map(event => `${event}`);
+            }
+            catch (e) {
+            }
         }
         return ['motion'];
     }
@@ -480,7 +485,7 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
         ret.push({
             subgroup: 'Advanced',
             title: 'Motion Sensor Events',
-            description: 'Which camera events set the motion sensor. Defaults to the motion rule. Selecting a detection class instead is useful for consumers that only understand a motion sensor, such as the HomeKit camera accessory.',
+            description: 'Which camera events set the motion sensor. Defaults to the motion rule. Selecting a detection class instead is useful for consumers that only understand a motion sensor, such as the HomeKit camera accessory. Selecting nothing leaves the motion sensor unused, which is reasonable if only object detection events are wanted.',
             type: 'string',
             key: 'onvifMotionEvents',
             multiple: true,
