@@ -41,9 +41,11 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
     rtspMediaStreamOptions: Promise<UrlMediaStreamOptions[]>;
     intercom = new OnvifIntercom(this);
     /**
-     * Identifies the current push subscription's callback. This is deliberately not persisted:
-     * a plugin reload invalidates it, so a late POST from a camera holding a stale subscription
-     * is rejected rather than resurrecting torn down state.
+     * Identifies this camera's push callback. Generated once per device instance and never
+     * persisted, so a plugin reload produces a new token and a camera still holding a
+     * subscription from the previous process is rejected rather than resurrecting torn down
+     * state. It deliberately survives a listener restart, so the callback url shown in settings
+     * does not churn every time a setting is saved.
      */
     pushToken: string;
     pushHandler: (xml: string) => void;
@@ -235,6 +237,12 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
             || this.storage.getItem('onvifPushFallback') === 'true';
     }
 
+    getPushToken() {
+        if (!this.pushToken)
+            this.pushToken = crypto.randomBytes(16).toString('hex');
+        return this.pushToken;
+    }
+
     async getPushCallbackUrl() {
         // the endpoint must be public because the camera cannot authenticate with scrypted, and
         // insecure because cameras generally will not trust scrypted's self signed certificate.
@@ -242,7 +250,7 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
             public: true,
             insecure: true,
         });
-        return `${endpoint}push/${this.pushToken}`;
+        return `${endpoint}push/${this.getPushToken()}`;
     }
 
     createPushOptions(): OnvifPushOptions {
@@ -255,13 +263,13 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
                     this.storage.setItem('onvifPushFallback', 'true');
                     await this.updateDevice();
                 }
-                this.pushToken = crypto.randomBytes(16).toString('hex');
                 return this.getPushCallbackUrl();
             },
             register: handler => this.pushHandler = handler,
             unregister: () => {
+                // dropping the handler is what makes the endpoint reject callbacks. the token
+                // is left alone so the url stays stable across a listener restart.
                 this.pushHandler = undefined;
-                this.pushToken = undefined;
             },
         };
     }
@@ -495,7 +503,7 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
             value: motionEvents.map(toChoice),
         });
 
-        if (this.pushToken) {
+        if (this.pushEndpointEnabled()) {
             ret.push({
                 subgroup: 'Advanced',
                 title: 'ONVIF Push Callback',
