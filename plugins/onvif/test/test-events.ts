@@ -327,6 +327,75 @@ async function main() {
         await assert.rejects(() => client.pushRenew(), /renew rejected/);
     });
 
+    // ---- tapo ----------------------------------------------------------------------------
+
+    await test('tapo person maps to person', async () => {
+        const { client, ret, events } = createClient();
+        client.detections = new Map();
+        await client.handlePushXml(ret, notifyXml({
+            topic: 'tns1:RuleEngine/PeopleDetector/People',
+            data: [['IsPeople', 'true']],
+        }));
+        assert.deepStrictEqual(events, [{ event: OnvifEvent.Detection, className: 'person' }]);
+    });
+
+    await test('tapo person ignores IsPeople false', async () => {
+        const { client, ret, events } = createClient();
+        client.detections = new Map();
+        await client.handlePushXml(ret, notifyXml({
+            topic: 'tns1:RuleEngine/PeopleDetector/People',
+            data: [['IsPeople', 'false']],
+        }));
+        assert.deepStrictEqual(events, []);
+    });
+
+    await test('tapo vehicle maps to vehicle even when the advertised schema omits IsVehicle', async () => {
+        const { client, ret, events } = createClient();
+        // the schema as GetEventProperties would have reported it: IsTPSmartEvent only.
+        client.detections = new Map([['IsTPSmartEvent', 'motion']]);
+        await client.handlePushXml(ret, notifyXml({
+            topic: 'tns1:RuleEngine/TPSmartEventDetector/TPSmartEvent',
+            data: [['IsTPSmartEvent', 'true'], ['IsVehicle', 'true']],
+        }));
+        assert.deepStrictEqual(events, [{ event: OnvifEvent.Detection, className: 'vehicle' }]);
+    });
+
+    await test('an Initialized tapo detection does not notify', async () => {
+        for (const [topic, name] of [
+            ['tns1:RuleEngine/PeopleDetector/People', 'IsPeople'],
+            ['tns1:RuleEngine/TPSmartEventDetector/TPSmartEvent', 'IsVehicle'],
+        ]) {
+            const { client, ret, events } = createClient();
+            client.detections = new Map();
+            await client.handlePushXml(ret, notifyXml({
+                topic,
+                data: [[name, 'true']],
+                propertyOperation: 'Initialized',
+            }));
+            assert.deepStrictEqual(events, [], `${topic} raised an Initialized detection`);
+        }
+    });
+
+    await test('an unknown tapo smart field is not mapped to a class', async () => {
+        const { client, ret, events } = createClient();
+        client.detections = new Map();
+        await client.handlePushXml(ret, notifyXml({
+            topic: 'tns1:RuleEngine/TPSmartEventDetector/TPSmartEvent',
+            data: [['IsPet', 'true']],
+        }));
+        assert.deepStrictEqual(events, []);
+    });
+
+    await test('tapo cell motion is still generic motion', async () => {
+        const { client, ret, events } = createClient();
+        client.detections = new Map();
+        await client.handlePushXml(ret, notifyXml({
+            topic: 'tns1:RuleEngine/CellMotionDetector/Motion',
+            data: [['IsMotion', 'true']],
+        }));
+        assert.deepStrictEqual(events, [{ event: OnvifEvent.MotionBuggy, className: undefined }]);
+    });
+
     console.log();
     console.log(`${passed} passed, ${failed} failed`);
     if (failed)

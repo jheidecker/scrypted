@@ -275,6 +275,23 @@ export class OnvifCameraAPI {
                 ret.emit('event', OnvifEvent.MotionBuggy);
             }
         }
+        // TP-Link/Tapo does not report person detection through the standard ObjectDetector
+        // rule tree.
+        else if (eventTopic.includes('RuleEngine/PeopleDetector/People')) {
+            if (operation !== 'Initialized' && isTrue(data.IsPeople))
+                ret.emit('event', OnvifEvent.Detection, 'person');
+        }
+        // Some Tapo firmware emits IsVehicle at runtime even when GetEventProperties declares
+        // only IsTPSmartEvent. Runtime Notify fields must therefore not be restricted to the
+        // advertised schema.
+        else if (eventTopic.includes('RuleEngine/TPSmartEventDetector/TPSmartEvent')) {
+            if (operation !== 'Initialized' && isTrue(data.IsVehicle))
+                ret.emit('event', OnvifEvent.Detection, 'vehicle');
+            for (const eventName of Object.keys(data)) {
+                if (eventName !== 'IsVehicle')
+                    this.logUnknownProperty(eventTopic, eventName);
+            }
+        }
         else if (eventTopic.includes('RuleEngine/ObjectDetector')) {
             // an Initialized notification reports the current state of the rule rather than a
             // new detection, and must not surface as a user facing object detection.
@@ -456,6 +473,16 @@ export class OnvifCameraAPI {
                             }
                         }
                     }
+                }
+                catch (e) {
+                }
+
+                try {
+                    // Tapo advertises person detection outside the standard ObjectDetector
+                    // tree. Vehicle is deliberately not claimed here, because it is not
+                    // advertised even on firmware that reports it at runtime.
+                    if (data.topicSet.ruleEngine.peopleDetector)
+                        this.detections.set('IsPeople', 'person');
                 }
                 catch (e) {
                 }

@@ -5,7 +5,7 @@ import onvif from 'onvif';
 import { Stream } from "stream";
 import xml2js from 'xml2js';
 import { RtspProvider, RtspSmartCamera, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
-import { connectCameraAPI, OnvifCameraAPI } from "./onvif-api";
+import { connectCameraAPI, OnvifCameraAPI, OnvifEvent } from "./onvif-api";
 import { autoconfigureSettings, configureCodecs, getCodecs } from "./onvif-configure";
 import { listenEvents, OnvifEventTransport, OnvifPushOptions } from "./onvif-events";
 import { OnvifIntercom } from "./onvif-intercom";
@@ -133,6 +133,11 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
     async getObjectTypes(): Promise<ObjectDetectionTypes> {
         const client = await this.getClient();
         const classes = await client.getEventTypes();
+        // include classes that were only ever observed at runtime.
+        for (const className of this.getStoredDetectionClasses()) {
+            if (!classes.includes(className))
+                classes.push(className);
+        }
         return {
             classes,
         }
@@ -317,6 +322,32 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
         }
     }
 
+    /**
+     * Records an object detection class observed at runtime. Some firmware reports classes that
+     * GetEventProperties never advertised, so the runtime notification is authoritative.
+     */
+    addDetectionClass(className: string) {
+        const classes = this.getStoredDetectionClasses();
+        if (classes.includes(className))
+            return;
+        classes.push(className);
+        this.storage.setItem('onvifDetectionClasses', JSON.stringify(classes));
+        this.storage.setItem('onvifDetector', 'true');
+        this.console.log('discovered onvif detection class:', className);
+        this.updateDevice();
+    }
+
+    getStoredDetectionClasses(): string[] {
+        try {
+            const classes = JSON.parse(this.storage.getItem('onvifDetectionClasses'));
+            if (Array.isArray(classes))
+                return classes;
+        }
+        catch (e) {
+        }
+        return [];
+    }
+
     async listenEvents() {
         const client = await this.createClient();
         try {
@@ -331,6 +362,11 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
 
         const transport = this.getEventTransport();
         const ret = await listenEvents(this, client, 30000, transport === 'pullpoint' ? undefined : this.createPushOptions());
+
+        ret.on('event', (event: OnvifEvent, className: string) => {
+            if (event === OnvifEvent.Detection && className)
+                this.addDetectionClass(className);
+        });
 
         return ret;
     }
