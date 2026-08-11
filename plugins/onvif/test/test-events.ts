@@ -229,6 +229,31 @@ async function main() {
         assert.deepStrictEqual(events, []);
     });
 
+    await test('getEventTypes claims person and vehicle from the advertised Tapo rules', async () => {
+        const { cam, client } = createClient();
+        // keys as the onvif tag name processor produces them: it lower cases the first letter
+        // only when the second is lower case, so TPSmartEventDetector keeps its capital.
+        cam.getEventProperties = (cb: any) => cb(null, {
+            topicSet: {
+                ruleEngine: {
+                    cellMotionDetector: {},
+                    peopleDetector: {},
+                    TPSmartEventDetector: {},
+                },
+            },
+        }, '<xml/>');
+        const classes = await client.getEventTypes();
+        assert.deepStrictEqual([...classes].sort(), ['person', 'vehicle']);
+    });
+
+    await test('getEventTypes claims nothing for a camera without the Tapo rules', async () => {
+        const { cam, client } = createClient();
+        cam.getEventProperties = (cb: any) => cb(null, {
+            topicSet: { ruleEngine: { cellMotionDetector: {} } },
+        }, '<xml/>');
+        assert.deepStrictEqual(await client.getEventTypes(), []);
+    });
+
     // ---- push transport ------------------------------------------------------------------
 
     await test('a pushed Notify is classified identically to a pulled one', async () => {

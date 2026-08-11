@@ -478,11 +478,16 @@ export class OnvifCameraAPI {
                 }
 
                 try {
-                    // Tapo advertises person detection outside the standard ObjectDetector
-                    // tree. Vehicle is deliberately not claimed here, because it is not
-                    // advertised even on firmware that reports it at runtime.
+                    // Tapo reports person and vehicle detection outside the standard
+                    // ObjectDetector tree.
                     if (data.topicSet.ruleEngine.peopleDetector)
                         this.detections.set('IsPeople', 'person');
+                    // The TPSmartEvent rule only declares IsTPSmartEvent, but it is the rule
+                    // that carries IsVehicle at runtime. Claim vehicle from the rule rather
+                    // than from the declared property, otherwise the class cannot be selected
+                    // anywhere in Scrypted until a vehicle happens to drive past.
+                    if (data.topicSet.ruleEngine.TPSmartEventDetector)
+                        this.detections.set('IsVehicle', 'vehicle');
                 }
                 catch (e) {
                 }
