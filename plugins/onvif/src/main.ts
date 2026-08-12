@@ -57,6 +57,7 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
     pushHandler: (xml: string) => void;
     loggedPushContentType = false;
     loggedEventLogPath = false;
+    pushEndpoint: Promise<string>;
     eventLogWrites = Promise.resolve();
 
     constructor(nativeId: string, provider: RtspProvider) {
@@ -254,11 +255,16 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
     async getPushCallbackUrl() {
         // the endpoint must be public because the camera cannot authenticate with scrypted, and
         // insecure because cameras generally will not trust scrypted's self signed certificate.
-        const endpoint = await endpointManager.getLocalEndpoint(this.nativeId, {
-            public: true,
-            insecure: true,
-        });
-        return `${endpoint}push/${this.getPushToken()}`;
+        // memoized because this is rendered in settings, and resolving it is a round trip to
+        // the server for the address and port.
+        if (!this.pushEndpoint) {
+            this.pushEndpoint = endpointManager.getLocalEndpoint(this.nativeId, {
+                public: true,
+                insecure: true,
+            });
+            this.pushEndpoint.catch(() => this.pushEndpoint = undefined);
+        }
+        return `${await this.pushEndpoint}push/${this.getPushToken()}`;
     }
 
     createPushOptions(): OnvifPushOptions {
@@ -635,11 +641,11 @@ class OnvifCamera extends RtspSmartCamera implements ObjectDetector, Intercom, V
             this.storage.setItem(key, TRANSPORT_CHOICES[value as string] || 'auto');
             // an explicit choice supersedes any earlier automatic fallback.
             this.storage.removeItem('onvifPushFallback');
-            // report the endpoint interface before the listener restarts and generates the
-            // callback url, otherwise the server will not route the camera's post. awaited so
-            // the save does not complete while the device is still being re-registered with a
-            // different interface list.
-            await this.updateDevice();
+            // report the endpoint interface so the server will route the camera's post. not
+            // awaited: it emits the settings event synchronously, and the listener restart is
+            // already deferred, so blocking the save on the re-registration only delays the ui.
+            // getCallbackUrl awaits the registration itself before handing out a url.
+            this.updateDevice();
             // restart the event listener, as RtspSmartCamera.putSetting would have.
             this.listener?.then(l => l.emit('error', new Error("new settings")));
             return;
