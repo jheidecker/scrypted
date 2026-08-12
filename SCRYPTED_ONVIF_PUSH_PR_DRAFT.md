@@ -134,6 +134,14 @@ cd plugins/onvif  && npm run build   # ok
 cd ../reolink     && npm run build   # ok, shares the symlinked sources
 ```
 
+Nothing outside `plugins/onvif` is modified. Note that `./npm-install.sh` leaves the
+`external/werift` submodule dirty — `npm install` rewrites that submodule's own
+`package-lock.json` to align its `packages/rtp` workspace version. It shows up as ` m
+external/werift` in `git status`, with the recorded submodule commit unchanged. That is an
+artifact of the setup script, not part of this change, and it cannot be committed here in any
+case: the parent repo only records the submodule's SHA. Clear it with
+`git -C external/werift checkout -- package-lock.json`.
+
 Live:
 
 - Base commit: `70c2597`
