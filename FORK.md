@@ -261,7 +261,7 @@ onvif push callback body could not be decoded. content-type:  <- see limitations
   camera tested posts `application/soap+xml`. A camera that does not would need a one-line change
   in `server/`, outside this branch. The decode failure is logged once with the observed
   content-type.
-- **The camera's `UtcTime` is not trustworthy** and is never used for freshness, ordering or
+- **TP-Link camera's `UtcTime` is not trustworthy** and is never used for freshness, ordering or
   dedupe. Observed in the field: a detection arriving 16 hours after the timestamp the camera put
   on it. It is recorded in the debug log for diagnosis only.
 - **Push reverses the connection direction.** The camera must reach the Scrypted host on the
@@ -272,9 +272,14 @@ onvif push callback body could not be decoded. content-type:  <- see limitations
 - **The motion-event gating has no unit test.** `onvif-events.ts` imports `@scrypted/sdk` as a
   value, and the SDK cannot load outside the plugin host, so `listenEvents` is not reachable from
   the test harness. The classifier it feeds is covered; the gating itself was verified live only.
-- **No soak beyond a few hours** at time of writing.
 
 # Verified on
 
-Scrypted 0.143.0, Docker host networking, Ubuntu 22.04 x64. Six TP-Link Tapo cameras: C320WS ×3,
-C325WB, C560WS, C110. Full results are in `SCRYPTED_ONVIF_PUSH_PR_DRAFT.md`.
+Scrypted 0.143.0, Docker host networking, Ubuntu 22.04 x64. Six TP-Link Tapo cameras (Aug-2026):
+
+ - C320WS 2.0 - FW 1.6.3
+ - C325WB 1.0 - FW 1.4.4 
+ - C560WS 1.0 - FW 1.1.10
+ - C110 2.0 - FW 1.5.4
+
+Full results are in `SCRYPTED_ONVIF_PUSH_PR_DRAFT.md`.
