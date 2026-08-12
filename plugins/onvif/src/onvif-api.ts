@@ -44,6 +44,16 @@ export function stripNamespaces(topic: string) {
 // the onvif library always requests a PT2M lease for both Subscribe and Renew.
 const DEFAULT_LEASE_MS = 120000;
 
+/**
+ * The TPSmartEvent rule declares only IsTPSmartEvent, but carries these at runtime. Scrypted's
+ * own vocabulary is used for the class rather than the vendor's, so a single consumer can match
+ * detections from this camera and from a detection model.
+ */
+const TPSMART_DETECTION_CLASSES: Record<string, string> = {
+    IsVehicle: 'vehicle',
+    IsPet: 'animal',
+};
+
 function ensureArray<T>(value: T | T[]): T[] {
     if (value === undefined || value === null)
         return [];
@@ -306,15 +316,18 @@ export class OnvifCameraAPI {
             if (operation !== 'Initialized' && isTrue(data.IsPeople))
                 ret.emit('event', OnvifEvent.Detection, 'person');
         }
-        // Some Tapo firmware emits IsVehicle at runtime even when GetEventProperties declares
-        // only IsTPSmartEvent. Runtime Notify fields must therefore not be restricted to the
-        // advertised schema.
+        // Some Tapo firmware emits IsVehicle and IsPet at runtime even though
+        // GetEventProperties declares only IsTPSmartEvent. Runtime Notify fields must therefore
+        // not be restricted to the advertised schema.
         else if (eventTopic.includes('RuleEngine/TPSmartEventDetector/TPSmartEvent')) {
-            if (operation !== 'Initialized' && isTrue(data.IsVehicle))
-                ret.emit('event', OnvifEvent.Detection, 'vehicle');
-            for (const eventName of Object.keys(data)) {
-                if (eventName !== 'IsVehicle')
+            for (const [eventName, value] of Object.entries(data)) {
+                const className = TPSMART_DETECTION_CLASSES[eventName];
+                if (!className) {
                     this.logUnknownProperty(eventTopic, eventName);
+                    continue;
+                }
+                if (operation !== 'Initialized' && isTrue(value))
+                    ret.emit('event', OnvifEvent.Detection, className);
             }
         }
         else if (eventTopic.includes('RuleEngine/ObjectDetector')) {
@@ -508,11 +521,13 @@ export class OnvifCameraAPI {
                     if (data.topicSet.ruleEngine.peopleDetector)
                         this.detections.set('IsPeople', 'person');
                     // The TPSmartEvent rule only declares IsTPSmartEvent, but it is the rule
-                    // that carries IsVehicle at runtime. Claim vehicle from the rule rather
-                    // than from the declared property, otherwise the class cannot be selected
-                    // anywhere in Scrypted until a vehicle happens to drive past.
-                    if (data.topicSet.ruleEngine.TPSmartEventDetector)
-                        this.detections.set('IsVehicle', 'vehicle');
+                    // that carries the smart classes at runtime. Claim them from the rule
+                    // rather than from the declared property, otherwise a class cannot be
+                    // selected anywhere in Scrypted until one happens to occur.
+                    if (data.topicSet.ruleEngine.TPSmartEventDetector) {
+                        for (const [property, className] of Object.entries(TPSMART_DETECTION_CLASSES))
+                            this.detections.set(property, className);
+                    }
                 }
                 catch (e) {
                 }

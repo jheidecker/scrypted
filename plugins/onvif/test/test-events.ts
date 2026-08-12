@@ -243,7 +243,7 @@ async function main() {
             },
         }, '<xml/>');
         const classes = await client.getEventTypes();
-        assert.deepStrictEqual([...classes].sort(), ['person', 'vehicle']);
+        assert.deepStrictEqual([...classes].sort(), ['animal', 'person', 'vehicle']);
     });
 
     await test('getEventTypes claims nothing for a camera without the Tapo rules', async () => {
@@ -466,12 +466,35 @@ async function main() {
         }
     });
 
-    await test('an unknown tapo smart field is not mapped to a class', async () => {
+    await test('tapo pet maps to animal', async () => {
+        // captured from a Tapo C320WS, which declares only IsTPSmartEvent on this rule.
+        const { client, ret, events } = createClient();
+        client.detections = new Map([['IsTPSmartEvent', 'motion']]);
+        await client.handlePushXml(ret, notifyXml({
+            topic: 'tns1:RuleEngine/TPSmartEventDetector/TPSmartEvent',
+            data: [['IsPet', 'true']],
+        }));
+        assert.deepStrictEqual(events, [{ event: OnvifEvent.Detection, className: 'animal' }]);
+    });
+
+    await test('several tapo smart classes in one message all resolve', async () => {
         const { client, ret, events } = createClient();
         client.detections = new Map();
         await client.handlePushXml(ret, notifyXml({
             topic: 'tns1:RuleEngine/TPSmartEventDetector/TPSmartEvent',
-            data: [['IsPet', 'true']],
+            data: [['IsTPSmartEvent', 'true'], ['IsVehicle', 'true'], ['IsPet', 'true']],
+        }));
+        assert.deepStrictEqual(events.map(e => e.className).sort(), ['animal', 'vehicle']);
+    });
+
+    await test('an unknown tapo smart field is not mapped to a class', async () => {
+        // IsPackage is not a class this plugin claims to understand. it should be reported as
+        // unhandled rather than guessed at.
+        const { client, ret, events } = createClient();
+        client.detections = new Map();
+        await client.handlePushXml(ret, notifyXml({
+            topic: 'tns1:RuleEngine/TPSmartEventDetector/TPSmartEvent',
+            data: [['IsPackage', 'true']],
         }));
         assert.deepStrictEqual(events, []);
     });
